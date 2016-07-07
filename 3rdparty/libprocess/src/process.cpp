@@ -1390,7 +1390,7 @@ void SocketManager::link_connect(
     .onAny(lambda::bind(
         &internal::ignore_recv_data,
         lambda::_1,
-        socket,
+        new Socket(*socket),
         data,
         size));
 
@@ -1410,6 +1410,8 @@ void SocketManager::link_connect(
   if (encoder != NULL) {
     internal::send(encoder, new Socket(*socket));
   }
+
+  delete socket;
 }
 
 
@@ -2098,6 +2100,7 @@ void SocketManager::swap_implementing_socket(const Socket& from, Socket* to)
   CHECK(sockets.count(to_fd) == 0);
 
   synchronized (mutex) {
+    delete sockets[from_fd];
     sockets.erase(from_fd);
     sockets[to_fd] = to;
 

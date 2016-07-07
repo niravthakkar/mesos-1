@@ -794,7 +794,6 @@ void Slave::detected(const Future<Option<MasterInfo>>& _master)
     master = UPID(_master.get().get().pid());
 
     LOG(INFO) << "New master detected at " << master.get();
-    link(master.get());
 
     if (state == TERMINATING) {
       LOG(INFO) << "Skipping registration because slave is terminating";
@@ -857,6 +856,10 @@ void Slave::authenticate()
   }
 
   LOG(INFO) << "Authenticating with master " << master.get();
+
+  // Ensure there is a link to the master before we start
+  // communicating with it.
+  link(master.get());
 
   CHECK(authenticatee == NULL);
 
@@ -1196,6 +1199,13 @@ void Slave::doReliableRegistration(Duration maxBackoff)
   CHECK(state == DISCONNECTED) << state;
 
   CHECK_NE("cleanup", flags.recover);
+
+  // Ensure there is a link to the master before we start
+  // communicating with it. We want to link after the initial
+  // registration backoff in order to avoid all of the agents
+  // establishing connections with the master at once.
+  // See MESOS-5330.
+  link(master.get());
 
   if (!info.has_id()) {
     // Registering for the first time.
@@ -1977,6 +1987,10 @@ void Slave::killTask(
 
   switch (executor->state) {
     case Executor::REGISTERING: {
+      LOG(WARNING) << "Transitioning the state of task " << taskId
+                   << " of framework " << frameworkId
+                   << " to TASK_KILED because the executor is not registered";
+
       // The executor hasn't registered yet.
       const StatusUpdate update = protobuf::createStatusUpdate(
           frameworkId,
@@ -1993,24 +2007,6 @@ void Slave::killTask(
       // task from 'executor->queuedTasks', so that if the executor
       // registers at a later point in time, it won't get this task.
       statusUpdate(update, UPID());
-
-      // TODO(jieyu): Here, we kill the executor if it no longer has
-      // any task to run and has not yet registered. This is a
-      // workaround for those single task executors that do not have a
-      // proper self terminating logic when they haven't received the
-      // task within a timeout.
-      if (executor->queuedTasks.empty()) {
-        CHECK(executor->launchedTasks.empty())
-            << " Unregistered executor '" << executor->id
-            << "' has launched tasks";
-
-        LOG(WARNING) << "Killing the unregistered executor " << *executor
-                     << " because it has no tasks";
-
-        executor->state = Executor::TERMINATING;
-
-        containerizer->destroy(executor->containerId);
-      }
       break;
     }
     case Executor::TERMINATING:
@@ -2731,6 +2727,27 @@ void Slave::registerExecutor(
         CHECK_SOME(state::checkpoint(path, executor->pid.get()));
       }
 
+      // Here, we kill the executor if it no longer has any task to run
+      // (e.g., framework sent a `killTask()`). This is a workaround for those
+      // single task executors (e.g., command executor) that do not have a
+      // proper self terminating logic when they haven't received the task
+      // within a timeout. Also note even if the agent restarts before sending
+      // this shutdown message, it is safe because the executor driver shuts
+      // down the executor if it gets disconnected from the agent before
+      // registration.
+      if (executor->queuedTasks.empty()) {
+        CHECK(executor->launchedTasks.empty())
+            << " Newly registered executor '" << executor->id
+            << "' has launched tasks";
+
+        LOG(WARNING) << "Shutting down the executor " << *executor
+                     << " because it has no tasks to run";
+
+        _shutdownExecutor(framework, executor);
+
+        return;
+      }
+
       // Tell executor it's registered and give it any queued tasks.
       ExecutorRegisteredMessage message;
       message.mutable_executor_info()->MergeFrom(executor->info);
@@ -2893,6 +2910,9 @@ void Slave::reregisterExecutor(
           statusUpdate(update, UPID());
         }
       }
+
+      // TODO(vinod): Similar to what we do in `registerExecutor()` the executor
+      // should be shutdown if it hasn't received any tasks.
       break;
     }
     default:
@@ -3580,6 +3600,8 @@ ExecutorInfo Slave::getExecutorInfo(
       executor.mutable_container()->CopyFrom(task.container());
     }
 
+    // TODO(jieyu): We should move those Mesos containerizer specific
+    // logic (e.g., 'hasRootfs') to Mesos containerizer.
     bool hasRootfs = task.has_container() &&
                      task.container().type() == ContainerInfo::MESOS &&
                      task.container().mesos().has_image();
@@ -3587,42 +3609,15 @@ ExecutorInfo Slave::getExecutorInfo(
     if (hasRootfs) {
       ContainerInfo* container = executor.mutable_container();
 
-      // For command-tasks, we are now copying the entire `task.container` into
-      // the `executorInfo`. Thus, `executor.container` now has the image if
-      // `task.container` had one. However, in case of rootfs, we want to run
-      // the command executor in the host filesystem and prepare/mount the image
-      // into the container as a volume (command executor will use pivot_root to
-      // mount the image). For this reason, we need to strip the image in
+      // For command tasks, we are now copying the entire
+      // `task.container` into the `executorInfo`. Thus,
+      // `executor.container` now has the image if `task.container`
+      // had one. However, in the case of Mesos container with rootfs,
+      // we want to run the command executor in the host filesystem
+      // and let the command executor pivot_root to the rootfs for its
+      // task. For this reason, we need to strip the image in
       // `executor.container.mesos`.
       container->mutable_mesos()->clear_image();
-
-      // As we will chroot in the command executor into a new rootfs,
-      // we need to modify the volume mount points to be under the new rootfs
-      // so the container path that the task sees is correct.
-      // NOTE: We only need to modify volumes with absolute path since
-      // relative paths are mounted in the sandbox and will automatically be
-      // mounted into the rootfs.
-      for (int i = 0; i < container->volumes_size(); ++i) {
-        Volume* volume = container->mutable_volumes(i);
-        if (path::absolute(volume->container_path())) {
-          volume->set_container_path(path::join(
-              COMMAND_EXECUTOR_ROOTFS_CONTAINER_PATH,
-              volume->container_path()));
-        }
-      }
-
-      container->set_type(ContainerInfo::MESOS);
-      Volume* volume = container->add_volumes();
-      volume->mutable_image()->CopyFrom(task.container().mesos().image());
-      volume->set_container_path(COMMAND_EXECUTOR_ROOTFS_CONTAINER_PATH);
-      volume->set_mode(Volume::RW);
-
-      size_t volumesSize = container->volumes_size();
-      if (volumesSize > 1) {
-        // Move the rootfs volume to the front as the other volumes
-        // will be mounting under the rootfs directory that's added last.
-        container->mutable_volumes()->SwapElements(0, volumesSize - 1);
-      }
 
       // We need to set the executor user as root as it needs to
       // perform chroot (even when switch_user is set to false).

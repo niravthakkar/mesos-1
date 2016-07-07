@@ -56,6 +56,7 @@
 #include "slave/containerizer/mesos/containerizer.hpp"
 
 #include "tests/containerizer.hpp"
+#include "tests/environment.hpp"
 #include "tests/flags.hpp"
 #include "tests/limiter.hpp"
 #include "tests/mesos.hpp"
@@ -685,13 +686,16 @@ TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
       "20141010-221431-251662764-60288-12345-0000");
   const ExecutorInfo& executor = slave.getExecutorInfo(frameworkInfo, task);
 
+  Try<string> sandbox = environment->mkdtemp();
+  ASSERT_SOME(sandbox);
+
   SlaveID slaveID;
   slaveID.set_value(UUID::random().toString());
   Future<bool> launch = containerizer.get()->launch(
       containerId,
       task,
       executor,
-      "/tmp",
+      sandbox.get(),
       "test",
       slaveID,
       slave.self(),
@@ -2077,6 +2081,93 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
 
   terminate(slave);
   wait(slave);
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This test ensures that if a `killTask()` for an executor is received by the
+// agent before the executor registers, the executor is properly cleaned up.
+TEST_F(SlaveTest, KillTaskUnregisteredExecutor)
+{
+  // Start a master.
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  // Start a slave.
+  Try<PID<Slave>> slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(0);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .Times(0);
+
+  EXPECT_CALL(exec, shutdown(_));
+
+  // Hold on to the executor registration message so that the task stays
+  // queued on the agent.
+  Future<Message> registerExecutorMessage =
+    DROP_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(registerExecutorMessage);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  Future<Nothing> executorLost;
+  EXPECT_CALL(sched, executorLost(&driver, DEFAULT_EXECUTOR_ID, _, _))
+    .WillOnce(FutureSatisfy(&executorLost));
+
+  // Kill the task enqueued on the agent.
+  driver.killTask(task.task_id());
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_KILLED, status->state());
+  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_UNREGISTERED, status->reason());
+
+  // Now let the executor register by spoofing the message.
+  RegisterExecutorMessage registerExecutor;
+  registerExecutor.ParseFromString(registerExecutorMessage->body);
+
+  process::post(registerExecutorMessage->from,
+                slave.get(),
+                registerExecutor);
+
+  AWAIT_READY(executorLost);
+
+  driver.stop();
+  driver.join();
 
   Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
 }

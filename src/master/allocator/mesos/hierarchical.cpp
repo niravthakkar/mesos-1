@@ -39,6 +39,7 @@ using mesos::master::InverseOfferStatus;
 
 using process::Failure;
 using process::Future;
+using process::Owned;
 using process::Timeout;
 
 namespace mesos {
@@ -138,8 +139,8 @@ void HierarchicalAllocatorProcess::initialize(
   // all roles.
   //
   // TODO(alexr): Consider introducing a sorter type for quota'ed roles.
-  roleSorter = roleSorterFactory();
-  quotaRoleSorter = roleSorterFactory();
+  roleSorter.reset(roleSorterFactory());
+  quotaRoleSorter.reset(roleSorterFactory());
 
   VLOG(1) << "Initialized hierarchical allocator process";
 
@@ -225,7 +226,7 @@ void HierarchicalAllocatorProcess::addFramework(
   if (!activeRoles.contains(role)) {
     activeRoles[role] = 1;
     roleSorter->add(role, roleWeight(role));
-    frameworkSorters[role] = frameworkSorterFactory();
+    frameworkSorters[role].reset(frameworkSorterFactory());
   } else {
     activeRoles[role]++;
   }
@@ -313,7 +314,6 @@ void HierarchicalAllocatorProcess::removeFramework(
     roleSorter->remove(role);
 
     CHECK(frameworkSorters.contains(role));
-    delete frameworkSorters[role];
     frameworkSorters.erase(role);
   }
 
@@ -516,17 +516,23 @@ void HierarchicalAllocatorProcess::updateSlave(
   // Check that all the oversubscribed resources are revocable.
   CHECK_EQ(oversubscribed, oversubscribed.revocable());
 
+  const Resources oldRevocable = slaves[slaveId].total.revocable();
+
   // Update the total resources.
 
   // Remove the old oversubscribed resources from the total and then
   // add the new estimate of oversubscribed resources.
   slaves[slaveId].total = slaves[slaveId].total.nonRevocable() + oversubscribed;
 
-  // Now, update the total resources in the role sorters.
-  roleSorter->update(slaveId, slaves[slaveId].total);
+  // Update the total resources in the `roleSorter` by removing the
+  // previous oversubscribed resources and adding the new
+  // oversubscription estimate.
+  roleSorter->remove(slaveId, oldRevocable);
+  roleSorter->add(slaveId, oversubscribed);
 
-  // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-  quotaRoleSorter->update(slaveId, slaves[slaveId].total.nonRevocable());
+  // NOTE: We do not need to update `quotaRoleSorter` because this
+  // function only changes the revocable resources on the slave, but
+  // the quota role sorter only manages non-revocable resources.
 
   LOG(INFO) << "Slave " << slaveId << " (" << slaves[slaveId].hostname << ")"
             << " updated with oversubscribed resources " << oversubscribed
@@ -601,42 +607,11 @@ void HierarchicalAllocatorProcess::updateAllocation(
 
   const string& role = frameworks[frameworkId].role;
 
-  // Here we apply offer operations to the allocated resources, which
-  // in turns leads to an update of the total. The available resources
-  // remain unchanged.
+  // Here we apply offer operations to the allocated and total
+  // resources in the allocator and each of the sorters. The available
+  // resources remain unchanged.
 
-  // Update the allocated resources.
-  Sorter* frameworkSorter = frameworkSorters[role];
-
-  Resources frameworkAllocation =
-    frameworkSorter->allocation(frameworkId.value(), slaveId);
-
-  Try<Resources> updatedFrameworkAllocation =
-    frameworkAllocation.apply(operations);
-
-  CHECK_SOME(updatedFrameworkAllocation);
-
-  frameworkSorter->update(
-      frameworkId.value(),
-      slaveId,
-      frameworkAllocation,
-      updatedFrameworkAllocation.get());
-
-  roleSorter->update(
-      role,
-      slaveId,
-      frameworkAllocation,
-      updatedFrameworkAllocation.get());
-
-  if (quotas.contains(role)) {
-    // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-    quotaRoleSorter->update(
-        role,
-        slaveId,
-        frameworkAllocation.nonRevocable(),
-        updatedFrameworkAllocation.get().nonRevocable());
-  }
-
+  // Update the per-slave allocation.
   Try<Resources> updatedSlaveAllocation =
     slaves[slaveId].allocated.apply(operations);
 
@@ -649,6 +624,56 @@ void HierarchicalAllocatorProcess::updateAllocation(
   CHECK_SOME(updatedTotal);
 
   slaves[slaveId].total = updatedTotal.get();
+
+  // Update the total and allocated resources in each sorter.
+  CHECK(frameworkSorters.contains(role));
+  const Owned<Sorter>& frameworkSorter = frameworkSorters[role];
+
+  Resources frameworkAllocation =
+    frameworkSorter->allocation(frameworkId.value(), slaveId);
+
+  Try<Resources> updatedFrameworkAllocation =
+    frameworkAllocation.apply(operations);
+
+  CHECK_SOME(updatedFrameworkAllocation);
+
+  // Update the total and allocated resources in the framework sorter
+  // for the current role.
+  frameworkSorter->remove(slaveId, frameworkAllocation);
+  frameworkSorter->add(slaveId, updatedFrameworkAllocation.get());
+
+  frameworkSorter->update(
+      frameworkId.value(),
+      slaveId,
+      frameworkAllocation,
+      updatedFrameworkAllocation.get());
+
+  // Update the total and allocated resources in the role sorter.
+  roleSorter->remove(slaveId, frameworkAllocation);
+  roleSorter->add(slaveId, updatedFrameworkAllocation.get());
+
+  roleSorter->update(
+      role,
+      slaveId,
+      frameworkAllocation,
+      updatedFrameworkAllocation.get());
+
+  // Update the total and allocated resources in the quota role
+  // sorter. Note that we always update the quota role sorter's total
+  // resources; we only update its allocated resources if this role
+  // has quota set.
+  quotaRoleSorter->remove(slaveId, frameworkAllocation.nonRevocable());
+  quotaRoleSorter->add(
+      slaveId, updatedFrameworkAllocation.get().nonRevocable());
+
+  if (quotas.contains(role)) {
+    // See comment at `quotaRoleSorter` declaration regarding non-revocable.
+    quotaRoleSorter->update(
+        role,
+        slaveId,
+        frameworkAllocation.nonRevocable(),
+        updatedFrameworkAllocation.get().nonRevocable());
+  }
 
   LOG(INFO) << "Updated allocation of framework " << frameworkId
             << " on slave " << slaveId
@@ -687,13 +712,17 @@ Future<Nothing> HierarchicalAllocatorProcess::updateAvailable(
   Try<Resources> updatedTotal = slaves[slaveId].total.apply(operations);
   CHECK_SOME(updatedTotal);
 
+  const Resources oldTotal = slaves[slaveId].total;
   slaves[slaveId].total = updatedTotal.get();
 
-  // Now, update the total resources in the role sorters.
-  roleSorter->update(slaveId, slaves[slaveId].total);
+  // Now, update the total resources in the role sorters by removing
+  // the previous resources at this slave and adding the new resources.
+  roleSorter->remove(slaveId, oldTotal);
+  roleSorter->add(slaveId, updatedTotal.get());
 
   // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-  quotaRoleSorter->update(slaveId, slaves[slaveId].total.nonRevocable());
+  quotaRoleSorter->remove(slaveId, oldTotal.nonRevocable());
+  quotaRoleSorter->add(slaveId, updatedTotal.get().nonRevocable());
 
   return Nothing();
 }
@@ -1489,7 +1518,7 @@ void HierarchicalAllocatorProcess::deallocate(
   // keep generating new inverse offers even though the framework had not
   // responded yet.
 
-  foreachvalue (Sorter* frameworkSorter, frameworkSorters) {
+  foreachvalue (const Owned<Sorter>& frameworkSorter, frameworkSorters) {
     foreach (const SlaveID& slaveId, slaveIds_) {
       CHECK(slaves.contains(slaveId));
 

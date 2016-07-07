@@ -1,3 +1,38 @@
+Release Notes - Mesos - Version 0.28.3
+--------------------------------------
+* This is a bug fix release.
+
+All Issues:
+** Bug
+  * [MESOS-5673] - Port mapping isolator may cause segfault if it bind mount root does not exist.
+  * [MESOS-5330] - Agent should backoff before connecting to the master.
+  * [MESOS-5543] - /dev/fd is missing in the Mesos containerizer environment.
+  * [MESOS-5691] - SSL downgrade support will leak sockets in CLOSE_WAIT status.
+  * [MESOS-5723] - SSL-enabled libprocess will leak incoming links to forks.
+  * [MESOS-5748] - Potential segfault in `link` when linking to a remote process.
+  * [MESOS-5073] - Mesos allocator leaks role sorter and quota role sorters.
+  * [MESOS-5698] - Quota sorter not updated for resource changes at agent.
+
+
+Release Notes - Mesos - Version 0.28.2
+--------------------------------------
+* This is a bug fix release.
+
+All Issues:
+** Bug
+  * [MESOS-4705] - Linux 'perf' parsing logic may fail when OS distribution has perf backports.
+  * [MESOS-5239] - Persistent volume DockerContainerizer support assumes proper mount propagation setup on the host.
+  * [MESOS-5253] - Isolator cleanup should not be invoked if they are not prepared yet.
+  * [MESOS-5282] - Destroy container while provisioning volume images may lead to a race.
+  * [MESOS-5312] - Env `MESOS_SANDBOX` is not set properly for command tasks that changes rootfs.
+  * [MESOS-4885] - Unzip should force overwrite.
+  * [MESOS-5449] - Memory leak in SchedulerProcess.declineOffer.
+  * [MESOS-5380] - Killing a queued task can cause the corresponding command executor to never terminate. 
+
+** Improvement
+  * [MESOS-5307] - Sandbox mounts should not be in the host mount namespace.
+
+
 Release Notes - Mesos - Version 0.28.1
 --------------------------------------
 * This is a bug fix release.
