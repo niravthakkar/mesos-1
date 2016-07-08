@@ -138,3 +138,33 @@ index 0daf308..1136e0d 100644
      return false;
    }
    const char *p = char_class;
+diff --git a/m4/pc_from_ucontext.m4 b/m4/pc_from_ucontext.m4
+index daffddb..5386234 100644
+--- a/m4/pc_from_ucontext.m4
++++ b/m4/pc_from_ucontext.m4
+@@ -20,6 +20,7 @@ AC_DEFUN([AC_PC_FROM_UCONTEXT],
+    pc_fields="$pc_fields uc_mcontext.uc_regs->gregs[[PT_NIP]]" # Linux (ppc)
+    pc_fields="$pc_fields uc_mcontext.gregs[[R15]]"     # Linux (arm old [untested])
+    pc_fields="$pc_fields uc_mcontext.arm_pc"           # Linux (arm new [untested])
++   pc_fields="$pc_fields uc_mcontext.psw.addr"         # Linux (s390x)
+    pc_fields="$pc_fields uc_mcontext.mc_eip"           # FreeBSD (i386)
+    pc_fields="$pc_fields uc_mcontext.mc_rip"           # FreeBSD (x86_64 [untested])
+    pc_fields="$pc_fields uc_mcontext.__gregs[[_REG_EIP]]"  # NetBSD (i386)
+diff --git a/src/signalhandler_unittest.sh b/src/signalhandler_unittest.sh
+index 265cd45..4be7f9e 100755
+--- a/src/signalhandler_unittest.sh
++++ b/src/signalhandler_unittest.sh
+@@ -74,7 +74,12 @@ fi
+
+ # Test for a case the program kills itself by SIGSEGV.
+ GOOGLE_LOG_DIR=. $BINARY segv 2> signalhandler.out1
+-for pattern in SIGSEGV 0xdead main "Aborted at [0-9]"; do
++if [ x`uname -p` = x"s390x" ]; then
++       DEAD=0xd000     #s390x only returns page address in segv signal handler
++else
++       DEAD=0xdead
++fi
++for pattern in SIGSEGV $DEAD main "Aborted at [0-9]"; do
+   if ! grep --quiet "$pattern" signalhandler.out1; then
+     die "'$pattern' should appear in the output"
+   fi
