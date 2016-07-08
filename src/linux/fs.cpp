@@ -34,6 +34,8 @@
 #include <stout/os/read.hpp>
 #include <stout/os/stat.hpp>
 
+#include <linux/unistd.h>
+
 #include "linux/fs.hpp"
 
 using std::string;
