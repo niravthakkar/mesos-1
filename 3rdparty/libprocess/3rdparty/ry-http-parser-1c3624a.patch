@@ -26,3 +26,48 @@ index c03ec05..747f47b 100644
 
  /* Compile with -DHTTP_PARSER_STRICT=0 to make less checks, but run
   * faster
+diff --git a/http_parser.c b/http_parser.c
+index 9c5640f..5834e65 100644
+--- a/http_parser.c
++++ b/http_parser.c
+@@ -324,6 +324,7 @@ size_t http_parser_execute (http_parser *parser,
+   char c, ch;
+   const char *p = data, *pe;
+   int64_t to_read;
++  int8_t length;
+
+   enum state state = (enum state) parser->state;
+   enum header_states header_state = (enum header_states) parser->header_state;
+@@ -1460,9 +1461,9 @@ size_t http_parser_execute (http_parser *parser,
+       {
+         assert(parser->flags & F_CHUNKED);
+
+-        c = unhex[(unsigned char)ch];
+-        if (c == -1) goto error;
+-        parser->content_length = c;
++        length = unhex[(unsigned char)ch];
++        if (length == -1) goto error;
++        parser->content_length = length;
+         state = s_chunk_size;
+         break;
+       }
+@@ -1476,9 +1477,9 @@ size_t http_parser_execute (http_parser *parser,
+           break;
+         }
+
+-        c = unhex[(unsigned char)ch];
++        length = unhex[(unsigned char)ch];
+
+-        if (c == -1) {
++        if (length == -1) {
+           if (ch == ';' || ch == ' ') {
+             state = s_chunk_parameters;
+             break;
+@@ -1487,7 +1488,7 @@ size_t http_parser_execute (http_parser *parser,
+         }
+
+         parser->content_length *= 16;
+-        parser->content_length += c;
++        parser->content_length += length;
+         break;
+       }
