@@ -28,30 +28,121 @@ index b71bf02..864e5fb 100755
  fi
  
  PLATFORM_CCFLAGS="$PLATFORM_CCFLAGS $COMMON_FLAGS"
-diff --git a/port/atomic_pointer.h b/port/atomic_pointer.h
-index 35ae550..b4769b3 100644
---- a/port/atomic_pointer.h
-+++ b/port/atomic_pointer.h
+diff --git a/port/build_detect_platform b/port/build_detect_platform
+--- a/port/atomic_pointer.h  2016-03-08 13:44:18.301665963 +0000
++++ b/port/atomic_pointer.h  2016-03-08 13:44:41.051665963 +0000
 @@ -36,6 +36,8 @@
  #define ARCH_CPU_X86_FAMILY 1
  #elif defined(__ARMEL__)
  #define ARCH_CPU_ARM_FAMILY 1
-+#elif defined(__ppc__) || defined(__powerpc__) || defined(__powerpc64__)
-+#define ARCH_CPU_PPC_FAMILY 1
++#elif defined(__s390x__) || defined(__s390__)
++#define ARCH_CPU_S390_FAMILY 1
  #endif
- 
+
  namespace leveldb {
-@@ -83,6 +85,13 @@ inline void MemoryBarrier() {
+@@ -83,6 +85,14 @@
  }
  #define LEVELDB_HAVE_MEMORY_BARRIER
- 
-+// PPC
-+#elif defined(ARCH_CPU_PPC_FAMILY) && defined(__GNUC__)
+
++// S390
++#elif defined(ARCH_CPU_S390_FAMILY)
++
 +inline void MemoryBarrier() {
-+  asm volatile("lwsync" : : : "memory");
++  asm volatile("bcr 15,0" : : : "memory");
 +}
 +#define LEVELDB_HAVE_MEMORY_BARRIER
 +
  #endif
- 
+
  // AtomicPointer built using platform-specific MemoryBarrier()
+@@ -137,6 +147,7 @@
+ #undef LEVELDB_HAVE_MEMORY_BARRIER
+ #undef ARCH_CPU_X86_FAMILY
+ #undef ARCH_CPU_ARM_FAMILY
++#undef ARCH_CPU_S390_FAMILY
+
+ }  // namespace port
+ }  // namespace leveldb
+diff --git a/port/port_posix.h b/port/port_posix.h
+index 485ad10..6a81431 100644
+--- a/port/port_posix.h
++++ b/port/port_posix.h
+@@ -7,14 +7,19 @@
+ #ifndef STORAGE_LEVELDB_PORT_PORT_POSIX_H_
+ #define STORAGE_LEVELDB_PORT_PORT_POSIX_H_
+ 
++#undef PLATFORM_IS_LITTLE_ENDIAN
+ #if defined(OS_MACOSX)
+   #include <machine/endian.h>
++  #if defined(__DARWIN_LITTLE_ENDIAN) && defined(__DARWIN_BYTE_ORDER)
++    #define PLATFORM_IS_LITTLE_ENDIAN \
++        (__DARWIN_BYTE_ORDER == __DARWIN_LITTLE_ENDIAN)
++  #endif
+ #elif defined(OS_SOLARIS)
+   #include <sys/isa_defs.h>
+   #ifdef _LITTLE_ENDIAN
+-    #define LITTLE_ENDIAN
++    #define PLATFORM_IS_LITTLE_ENDIAN true
+   #else
+-    #define BIG_ENDIAN
++    #define PLATFORM_IS_LITTLE_ENDIAN false
+   #endif
+ #elif defined(OS_FREEBSD) || defined(OS_OPENBSD) || defined(OS_NETBSD) ||\
+       defined(OS_DRAGONFLYBSD)
+@@ -31,10 +36,8 @@
+ #include <string>
+ #include "port/atomic_pointer.h"
+ 
+-#ifdef LITTLE_ENDIAN
+-#define IS_LITTLE_ENDIAN true
+-#else
+-#define IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
++#ifndef PLATFORM_IS_LITTLE_ENDIAN
++  #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
+ #endif
+ 
+ #if defined(OS_MACOSX) || defined(OS_SOLARIS) || defined(OS_FREEBSD) ||\
+@@ -54,7 +57,8 @@
+ namespace leveldb {
+ namespace port {
+ 
+-static const bool kLittleEndian = IS_LITTLE_ENDIAN;
++static const bool kLittleEndian = PLATFORM_IS_LITTLE_ENDIAN;
++#undef PLATFORM_IS_LITTLE_ENDIAN
+ 
+ class CondVar;
+ 
+diff --git a/util/coding_test.cc b/util/coding_test.cc
+index 4cc856c..2c52b17 100644
+--- a/util/coding_test.cc
++++ b/util/coding_test.cc
+@@ -51,6 +51,29 @@ TEST(Coding, Fixed64) {
+   }
+ }
+ 
++// Test that encoding routines generate little-endian encodings
++TEST(Coding, EncodingOutput) {
++  std::string dst;
++  PutFixed32(&dst, 0x04030201);
++  ASSERT_EQ(4, dst.size());
++  ASSERT_EQ(0x01, static_cast<int>(dst[0]));
++  ASSERT_EQ(0x02, static_cast<int>(dst[1]));
++  ASSERT_EQ(0x03, static_cast<int>(dst[2]));
++  ASSERT_EQ(0x04, static_cast<int>(dst[3]));
++
++  dst.clear();
++  PutFixed64(&dst, 0x0807060504030201ull);
++  ASSERT_EQ(8, dst.size());
++  ASSERT_EQ(0x01, static_cast<int>(dst[0]));
++  ASSERT_EQ(0x02, static_cast<int>(dst[1]));
++  ASSERT_EQ(0x03, static_cast<int>(dst[2]));
++  ASSERT_EQ(0x04, static_cast<int>(dst[3]));
++  ASSERT_EQ(0x05, static_cast<int>(dst[4]));
++  ASSERT_EQ(0x06, static_cast<int>(dst[5]));
++  ASSERT_EQ(0x07, static_cast<int>(dst[6]));
++  ASSERT_EQ(0x08, static_cast<int>(dst[7]));
++}
++
+ TEST(Coding, Varint32) {
+   std::string s;
+   for (uint32_t i = 0; i < (32 * 32); i++) {
